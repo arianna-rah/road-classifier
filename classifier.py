@@ -44,23 +44,23 @@ class RSCDDataset(Dataset):
         samples_by_class = {class_name: [] for class_name in self.class_names}
     
         for original_label in self.root_dir.iterdir():
-            if original_label.isdir() and original_label.name in self.label_map:
+            if original_label.is_dir() and original_label.name in self.label_map:
                 mapped_label = self.label_map[original_label.name]
                 label_idx  = self.class_to_idx[mapped_label]
 
-            for img_path in original_label.glob('*.jpg'):
-                samples_by_class[mapped_label].append((str(img_path), label_idx, mapped_label))
+                for img_path in original_label.glob('*.jpg'):
+                    samples_by_class[mapped_label].append((str(img_path), label_idx, mapped_label))
         
         if max_samples and balanced:
             num_classes = len(self.class_names)
-            samples_by_class = max_samples // num_classes
+            samples_per_class = max_samples // num_classes
             for class_name, class_samples in samples_by_class.items():
                 n_to_take = min(samples_per_class, len(class_samples))
                 selected = random.sample(class_samples, n_to_take)
                 self.samples.extend(selected)
 
     def __len__(self):
-        return self.samples
+        return len(self.samples)
 
     def __getitem__(self, idx):
         img_path, label_idx, label_name = self.samples[idx]
@@ -72,7 +72,7 @@ class RSCDDataset(Dataset):
 
 class RSCDDatasetTestVali(Dataset):
     def __init__(self, root_dir, transform, label_map, class_names, class_to_idx, max_samples, balanced=True, samples_file=None):
-        self.root_dir = root_dir
+        self.root_dir = Path(root_dir)
         self.transform = transform
         self.label_map = label_map
         self.class_names = class_names
@@ -104,14 +104,14 @@ class RSCDDatasetTestVali(Dataset):
 
         if max_samples and balanced:
             num_classes = len(self.class_names)
-            samples_by_class = max_samples // num_classes
+            samples_per_class = max_samples // num_classes
             for class_name, class_samples in samples_by_class.items():
-                n_to_take = min(samples_by_class, len(class_samples))
+                n_to_take = min(samples_per_class, len(class_samples))
                 selected = random.sample(class_samples, n_to_take)
                 self.samples.extend(selected)
                 
     def __len__(self):
-            return self.samples
+            return len(self.samples)
 
     def __getitem__(self, idx):
         img_path, label_idx, label_name = self.samples[idx]
@@ -132,7 +132,6 @@ def find_distribution(dataset):
 
 train_transform = transforms.Compose([
     transforms.Resize((256, 256)),
-    transforms.RandomCrop(size=(224, 224)),
     transforms.RandomCrop(size=(224, 224)),
     transforms.RandomHorizontalFlip(p=0.5),
     transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
@@ -173,10 +172,10 @@ vali_dataset = RSCDDatasetTestVali(dataset_path_vali,
                           max_samples=20000)
 
 with open('train_samples.json', 'w') as fname:
-    json.dump(train_dataset.samples, f)
+    json.dump(train_dataset.samples, fname)
 
 with open('test_samples.json', 'w') as fname:
-    json.dump(test_dataset.samples, f)
+    json.dump(test_dataset.samples, fname)
 
 with open('vali_samples.json', 'w') as fname:
-    json.dump(vali_dataset.samples, f)
+    json.dump(vali_dataset.samples, fname)

@@ -8,6 +8,12 @@ import torch
 import json
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+import torchvision.models as models
+import torch.nn as nn
+from tqdm.auto import tqdm
+
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
 
 label_map = {
     **{c: "dry" for c in ["dry_asphalt_severe", "dry_asphalt_slight", "dry_asphalt_smooth", "dry_concrete_severe", "dry_concrete_slight", "dry_concrete_smooth", "dry_gravel", "dry_mud"]},
@@ -19,6 +25,11 @@ label_map = {
 
 class_to_idx = {"dry": 0, "wet": 1, "standing_water": 2, "snow": 3, "ice": 4}
 class_names = ["dry", "wet", "standing_water", "snow", "ice"]
+
+BATCH_SIZE = 64
+MAX_EPOCHS = 50
+
+device = "cuda" if torch.cuda.is_available() else "cpu" # Y/N for Kaggle????
 
 dataset_path_train = "/kaggle/input/rscd-dataset-1million/RSCD dataset-1million/train"
 dataset_path_test = "/kaggle/input/rscd-dataset-1million/RSCD dataset-1million/test_50k"
@@ -98,7 +109,7 @@ class RSCDDatasetTestVali(Dataset):
             elif "water" in str(image_path):
                 samples_by_class["standing_water"].append((str(image_path), self.class_to_idx["standing_water"], "standing_water"))
             elif "snow" in str(image_path):
-                samples_by_class["snow"].append((str(image_path), self.class_to_idx["snow"], "snow")]
+                samples_by_class["snow"].append((str(image_path), self.class_to_idx["snow"], "snow"))
             elif "ice" in str(image_path):
                 samples_by_class["ice"].append((str(image_path), self.class_to_idx["ice"], "ice"))
 
@@ -134,7 +145,7 @@ train_transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.RandomCrop(size=(224, 224)),
     transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms.TrivialAugmentWide(num_magnitude_bins=31),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])    
 ])
@@ -156,26 +167,134 @@ train_dataset = RSCDDataset(dataset_path_train,
                             label_map=label_map, 
                             class_names=class_names,
                             class_to_idx=class_to_idx,
-                            max_samples=160000)
+                            max_samples=160000,
+                            balanced=True,
+                            samples_file="train_samples.json")
 
 test_dataset = RSCDDatasetTestVali(dataset_path_test,
                           transform=test_transform,
                           label_map=label_map,
                           class_names=class_names,
                           class_to_idx=class_to_idx,
-                          max_samples=20000)
+                          max_samples=20000,
+                          balanced=True,
+                          samples_file="test_samples.json")
+                                   
 vali_dataset = RSCDDatasetTestVali(dataset_path_vali,
                           transform=test_transform,
                           label_map=label_map,
                           class_names=class_names,
                           class_to_idx=class_to_idx,
-                          max_samples=20000)
+                          max_samples=20000,
+                          balanced=True,
+                          samples_file="vali_samples.json")
 
-with open('train_samples.json', 'w') as fname:
-    json.dump(train_dataset.samples, fname)
+train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=2, pin_memory=True)
+test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, num_workers=2, pin_memory=True)
+vali_dataloader = DataLoader(vali_dataset, batch_size=BATCH_SIZE, num_workers=2, pin_memory=True)
 
-with open('test_samples.json', 'w') as fname:
-    json.dump(test_dataset.samples, fname)
+weights = models.Mobilenet_V3_Large_Weights.DEFAULT
+model = models.mobilenet_v3_large(weights=weights).to(device)
 
-with open('vali_samples.json', 'w') as fname:
-    json.dump(vali_dataset.samples, fname)
+for param in model.features.parameters():
+    param.requires_grad=False
+
+out_shape = len(class_names)
+
+features = model.classifier[-1].in_features
+model.classifier[-1] = nn.Linear(features, out_shape)
+
+loss_fn = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+
+class EarlyStopping:
+    def __init__(self, patience=5, delta=0.00001):
+        self.patience = patience
+        self.delta = delta
+        self.best_loss = None
+        self.wait_count = 0
+
+    def checkEarlyStop(self, val_loss):
+        if self.best_loss is None or val_loss < self.best_loss - self.delta:
+            self.best_loss = val_loss
+            self.wait_count = 0
+        else:
+            self.wait_count += 1
+            if self.wait_count >= self.patience:
+                return True
+            return False
+
+earlyStopping = EarlyStopping(patience=5, delta=0.00001)
+history = {'train_loss': [], 'train_accuracy': [], 'val_loss': [], 'val_accuracy': [] }
+
+for epoch in range(MAX_EPOCHS):
+    # TRAINING
+    model.train()
+    train_loss = 0.0
+    train_correct = 0
+    train_total = 0
+
+    train_progress = tqdm(train_dataloader, desc="Training", leave=False)
+    for images, labels in train_progress:
+        images, labels = images.to(device), labels.to(device)
+        label_pred = model(images)
+        loss = loss_fn(label_pred, labels)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step() 
+
+        _, predicted = torch.max(label_pred.data, 1)
+        train_total += labels.size(0)
+        train_correct += (predicted == labels).sum().item()
+        train_loss += loss.item()
+        train_progress.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'acc': f'{train_correct / train_total:.2f}%'
+        })
+
+    train_loss = train_loss / len(train_dataloader)
+    train_accuracy = train_correct / train_total
+
+    # VALIDATING
+    model.eval()
+    val_loss = 0.0
+    val_correct = 0
+    val_total = 0
+
+    with torch.inference_mode():
+        val_progress = tqdm(vali_dataloader, desc="Validation", leave=False)
+        for images, labels in val_progress:
+            images, labels = images.to(device), labels.to(device)
+            label_pred = model(images)
+            loss = loss_fn(label_pred, labels)
+
+            _, predicted = torch.max(label_pred.data, 1)
+            val_total += labels.size(0)
+            val_correct += (predicted == labels).sum().item()
+            val_loss += loss.item()
+            val_progress.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{val_correct / val_total:.2f}%'
+            })
+
+    val_loss = val_loss / len(vali_dataloader)
+    val_accuracy = val_correct / val_total
+    # KEEPING TRACK OF DATA FOR EARLY STOPPING
+    history['train_loss'].append(train_loss)
+    history['train_accuracy'].append(train_accuracy)
+    history['val_loss'].append(val_loss)
+    history['val_accuracy'].append(val_accuracy)
+
+    if epoch == 0 or val_accuracy > max(history['val_accuracy'][:-1]):
+        best_val_accuracy = val_accuracy
+        torch.save(model.state_dict(), 'best_model.pth')
+        print("Best val accuracy model saved!")
+
+    if earlyStopping.checkEarlyStop(val_loss):
+        print(f"Final val accuracy: {val_accuracy}.")
+        print(f"Final val loss: {val_loss}")
+        break
+
+print("Training complete!")
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
